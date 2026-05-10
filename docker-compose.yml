@@ -1,0 +1,22 @@
+services:
+  fusionpbx-bridge:
+    build: .
+    container_name: fusionpbx-bridge
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8880:8880"
+    environment:
+      DB_HOST: host.docker.internal
+      DB_PORT: 5432
+      DB_NAME: fusionpbx
+      DB_USER: fusionpbx
+      DB_PASS: ${DB_PASS}
+      API_KEY: ${API_KEY}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8880/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -52,7 +52,7 @@ function db(array $cfg): PDO
 
 // ── GET /api/health ───────────────────────────────────────────────────────
 
-if ($path === '/api/health') {
+if ($path === '/health') {
     try {
         db($config['db'])->query('SELECT 1');
         json_out(200, [
@@ -70,7 +70,7 @@ if ($path === '/api/health') {
 
 // ── GET /api/calls ────────────────────────────────────────────────────────
 
-if ($path === '/api/calls') {
+if ($path === '/calls') {
     $domain = trim($_GET['domain'] ?? '');
     if ($domain === '') {
         abort(400, 'Missing required parameter: domain');
