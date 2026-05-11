@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# checkhealth-remote
+# Tests the bridge API through nginx over HTTPS (the live path).
+# Usage: ./checkhealth-remote https://your-domain.com
+# Run from /opt/fusionpbx-bridge where .env lives.
+
+set -euo pipefail
+
+ENV_FILE="$(dirname "$0")/.env"
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <base-url>"
+  echo "Example: $0 https://pbx1.example.com"
+  exit 1
+fi
+
+BASE_URL="${1%/}"   # strip trailing slash
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "Error: .env not found at $ENV_FILE" >&2
+  exit 1
+fi
+
+KEY=$(grep -E '^API_KEY=' "$ENV_FILE" | cut -d= -f2)
+
+if [[ -z "$KEY" ]]; then
+  echo "Error: API_KEY not found in $ENV_FILE" >&2
+  exit 1
+fi
+
+echo "Testing via nginx: ${BASE_URL}/bridge/health ..."
+echo
+
+curl -sf \
+  -H "Authorization: Bearer $KEY" \
+  "${BASE_URL}/bridge/health" \
+  | python3 -m json.tool || {
+    echo
+    echo "Tips:"
+    echo "  - 'File not found' means nginx is routing to PHP-FPM — check the location /bridge/ block is in the 443 server block"
+    echo "  - 'Not found' means the request reached the app but the path didn't match — avoid /api/ in route names"
+    echo "  - Connection refused means nginx is not running or the domain doesn't resolve"
+    exit 1
+  }
+
