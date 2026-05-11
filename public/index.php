@@ -50,7 +50,7 @@ function db(array $cfg): PDO
     return $pdo;
 }
 
-// ── GET /api/health ───────────────────────────────────────────────────────
+// ── GET /health ───────────────────────────────────────────────────────
 
 if ($path === '/health') {
     try {
@@ -68,7 +68,7 @@ if ($path === '/health') {
     }
 }
 
-// ── GET /api/calls ────────────────────────────────────────────────────────
+// ── GET /calls ────────────────────────────────────────────────────────
 
 if ($path === '/calls') {
     $domain = trim($_GET['domain'] ?? '');
@@ -146,6 +146,24 @@ if ($path === '/calls') {
     }
 }
 
+// ── GET /domains ────────────────────────────────────────────────────────
+
+if ($path === '/domains') {
+      try {
+          $pdo  = db($config['db']);
+          $stmt = $pdo->query("
+              SELECT domain_name
+              FROM v_domains
+              WHERE domain_enabled = 'true'
+              ORDER BY domain_name ASC
+          "                                );
+          $domains = array_column($stmt->fetchAll(PDO::FETCH_ASSOC), 'domain_name');
+          json_out(200, ['data' => $domains]);
+      } catch (PDOException $e) {
+          error_log('fusionpbx-bridge db error: ' . $e->getMessage());
+          abort(500, 'Database error');
+      }
+  }
 // ── 404 ───────────────────────────────────────────────────────────────────
 
 abort(404, 'Not found');
