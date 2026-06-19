@@ -116,6 +116,12 @@ if ($path === '/calls') {
     // bridge_uuid. Depending on version the pointer sits on either leg, so
     // we match both directions. VERIFY against your own data with the
     // diagnostic in the notes, and adjust the EXISTS join if needed.
+    //
+    // NOTE: xml_cdr_uuid and bridge_uuid are NOT the same type across
+    // FusionPBX versions -- some store them as native `uuid`, others as
+    // `text`/`varchar`. Postgres refuses `uuid = text`, so both sides of
+    // the join are cast to ::text, which is valid no matter how each
+    // server typed the columns.
     $stmt = $pdo->prepare("
             SELECT
                 c.xml_cdr_uuid     AS uid,
@@ -140,8 +146,8 @@ if ($path === '/calls') {
                             FROM v_xml_cdr p
                             WHERE p.direction = 'inbound'
                               AND (
-                                    p.xml_cdr_uuid = c.bridge_uuid
-                                 OR p.bridge_uuid  = c.xml_cdr_uuid
+                                    p.xml_cdr_uuid::text = c.bridge_uuid::text
+                                 OR p.bridge_uuid::text  = c.xml_cdr_uuid::text
                               )
                         )
                     )
