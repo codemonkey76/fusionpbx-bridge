@@ -127,6 +127,12 @@ if ($path === '/calls') {
                 c.xml_cdr_uuid     AS uid,
                 c.caller_id_number AS from_number,
                 COALESCE(NULLIF(c.caller_destination, ''), c.destination_number) AS to_number,
+                -- The raw dialled/bridged destination. On a forwarded call it
+                -- differs from to_number: to_number resolves to caller_destination
+                -- (the DID that was called), while destination_number is where the
+                -- call was actually sent (e.g. an external mobile). Phoneus uses
+                -- this to split a diverted DID call into its inbound + outbound legs.
+                c.destination_number AS destination_number,
                 c.billsec          AS billable_seconds,
                 c.start_stamp      AS started_at,
                 c.direction,
@@ -168,15 +174,16 @@ if ($path === '/calls') {
 
     json_out(200, [
       'data' => array_map(fn($r) => [
-        'uid'              => $r->uid,
-        'from_number'      => $r->from_number,
-        'to_number'        => $r->to_number,
-        'billable_seconds' => (int) $r->billable_seconds,
-        'started_at'       => (new DateTimeImmutable($r->started_at))
+        'uid'                => $r->uid,
+        'from_number'        => $r->from_number,
+        'to_number'          => $r->to_number,
+        'destination_number' => $r->destination_number,
+        'billable_seconds'   => (int) $r->billable_seconds,
+        'started_at'         => (new DateTimeImmutable($r->started_at))
           ->format(DateTimeInterface::ATOM),
-        'direction'        => $r->direction,
-        'domain'           => $r->domain,
-        'hangup_cause'     => $r->hangup_cause,
+        'direction'          => $r->direction,
+        'domain'             => $r->domain,
+        'hangup_cause'       => $r->hangup_cause,
       ], $rows),
       'meta' => [
         'count'    => count($rows),
