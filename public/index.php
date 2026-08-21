@@ -117,6 +117,13 @@ if ($path === '/calls') {
     // we match both directions. VERIFY against your own data with the
     // diagnostic in the notes, and adjust the EXISTS join if needed.
     //
+    // A third linkage shape exists: on a loopback forward each leg's
+    // bridge_uuid points at the loopback channel rather than at the other
+    // leg, so both legs carry the SAME bridge_uuid and neither condition
+    // below matches. Those legs are both leg = 'a', so selection is already
+    // correct -- but the duration is not, which is what the billable_seconds
+    // subquery above pairs them up for.
+    //
     // NOTE: xml_cdr_uuid and bridge_uuid are NOT the same type across
     // FusionPBX versions -- some store them as native `uuid`, others as
     // `text`/`varchar`. Postgres refuses `uuid = text`, so both sides of
@@ -133,7 +140,30 @@ if ($path === '/calls') {
                 -- call was actually sent (e.g. an external mobile). Phoneus uses
                 -- this to split a diverted DID call into its inbound + outbound legs.
                 c.destination_number AS destination_number,
-                c.billsec          AS billable_seconds,
+                -- Billable seconds. Normally c.billsec, but a call that
+                -- FreeSWITCH forwards through a loopback channel (inbound DID
+                -- diverted or overflowed to an external number) truncates the
+                -- outbound leg's billsec to a couple of seconds: once the two
+                -- real endpoints are talking the loopback pair bows out of the
+                -- media path and hangs up (loopback_bowout), closing that CDR
+                -- while the conversation continues on the inbound leg. The
+                -- carrier bills from the outbound leg's answer_stamp to the
+                -- inbound leg's end_stamp, so derive it from the pair when the
+                -- pair exists and fall back to billsec when it doesn't -- which
+                -- is every non-forwarded call, i.e. the overwhelming majority.
+                COALESCE(
+                    (SELECT GREATEST(0, EXTRACT(EPOCH FROM (p.end_stamp - c.answer_stamp)))::int
+                       FROM v_xml_cdr p
+                      WHERE c.direction         = 'outbound'
+                        AND p.domain_name       = c.domain_name
+                        AND p.direction         = 'inbound'
+                        AND p.bridge_uuid::text = c.bridge_uuid::text
+                        AND p.xml_cdr_uuid     <> c.xml_cdr_uuid
+                        AND p.end_stamp IS NOT NULL
+                      ORDER BY p.end_stamp DESC
+                      LIMIT 1),
+                    c.billsec
+                )                  AS billable_seconds,
                 c.start_stamp      AS started_at,
                 c.direction,
                 c.domain_name      AS domain,
