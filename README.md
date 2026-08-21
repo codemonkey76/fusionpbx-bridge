@@ -167,7 +167,9 @@ Authorization: Bearer {api_key}
 **Notes:**
 
 - Only answered calls are returned (`billsec > 0`) — missed/unanswered calls are excluded at the query level
-- `billable_seconds` is `billsec` from FusionPBX (seconds from answer to hangup), **not** `duration`
+- `billable_seconds` is `billsec` from FusionPBX (seconds from answer to hangup), **not** `duration` —
+  except on loopback-forwarded calls, where `billsec` is truncated and the value is derived from the
+  leg pair instead (see [Loopback-forwarded calls](#loopback-forwarded-calls))
 - `started_at` is always ISO 8601 with timezone
 - `has_more: true` means page again with `after` set to the `started_at` of the last returned record
 
@@ -197,6 +199,13 @@ CREATE USER phoneus_bridge WITH PASSWORD 'strong_random_password';
 GRANT CONNECT ON DATABASE fusionpbx TO phoneus_bridge;
 GRANT USAGE ON SCHEMA public TO phoneus_bridge;
 GRANT SELECT ON v_xml_cdr TO phoneus_bridge;
+```
+
+Pairing the legs of a forwarded call looks up `v_xml_cdr` by `bridge_uuid`. If that column
+is not already indexed on a busy server, add it (as a superuser, not `phoneus_bridge`):
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS v_xml_cdr_bridge_uuid_idx ON v_xml_cdr (bridge_uuid);
 ```
 
 ### 2. Deploy the app
@@ -254,6 +263,44 @@ For reference, the relevant columns in `v_xml_cdr`:
 | `start_stamp`        | ✓    | Call start — used as cursor                                       |
 | `billsec`            | ✓    | **Billable seconds only** (post-answer). Use this, not `duration` |
 | `hangup_cause`       | ✓    | For diagnostics                                                   |
+| `destination_number` | ✓    | Where the call was actually sent — differs from `caller_destination` on a divert |
+| `answer_stamp`       | ✓    | Start of the billable window on a loopback-forwarded outbound leg |
+| `end_stamp`          | ✓    | End of the billable window — read off the paired inbound leg      |
+| `bridge_uuid`        | ✓    | Leg linkage — pairs the two legs of a forwarded call              |
+| `leg`                | ✓    | `a`/`b` — drives the leg-aware selection when `log-b-leg` is on   |
 | `duration`           | ✗    | Total duration including ring time — not used                     |
-| `answer_stamp`       | ✗    | Not needed — `billsec > 0` already implies answered               |
 | `missed_call`        | ✗    | Not needed — filtered out by `billsec > 0`                        |
+
+### Loopback-forwarded calls
+
+When FreeSWITCH forwards an inbound DID to an external number it bridges through a
+`loopback/` channel, whose other half re-enters the dialplan and bridges out a gateway.
+Once the two real endpoints are talking, the loopback pair removes itself from the media
+path and hangs up (`loopback_bowout`, on by default). That closes the outbound leg's CDR
+immediately, so its `billsec` covers only the second or two before the bowout — while the
+conversation continues on the inbound leg for as long as the parties talk. Reporting
+`billsec` verbatim under-bills those calls by an order of magnitude.
+
+Both legs are `direction`-opposite, share a `domain_name`, and — because each leg's
+`bridge_uuid` points at the loopback channel rather than at the other leg — carry the
+**same** `bridge_uuid`. `/api/calls` uses that to bill an outbound leg from its own
+`answer_stamp` to the paired inbound leg's `end_stamp`, matching what the carrier records.
+Calls with no such pair fall back to `billsec`, so ordinary traffic is untouched.
+
+Whether a deployment is affected depends on its dialplan style — check with:
+
+```sql
+SELECT domain_name,
+       count(*) AS answered_ob,
+       sum(CASE WHEN billsec <= 3 THEN 1 ELSE 0 END) AS under_3s
+FROM v_xml_cdr
+WHERE direction = 'outbound' AND billsec > 0
+  AND start_stamp >= now() - interval '30 days'
+GROUP BY domain_name
+HAVING count(*) > 50
+ORDER BY 3 DESC;
+```
+
+A domain that forwards most of its inbound traffic shows nearly all answered outbound legs
+at three seconds or less. The ratio varies enormously between domains on the same server,
+so a fleet can look healthy in aggregate while individual domains are almost entirely wrong.
