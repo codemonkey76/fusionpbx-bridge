@@ -107,16 +107,17 @@ ensure_index() {
     ssh -o BatchMode=yes "$host" 'bash -s' <<'REMOTE'
 set -euo pipefail
 
-psql() { sudo -u postgres command psql -qAt -d fusionpbx "$@"; }
+# Not a recursive call: psql here is an argument to sudo, which execs the binary.
+run_psql() { sudo -u postgres psql -qAt -d fusionpbx "$@"; }
 
-existing=$(psql -c "SELECT count(*) FROM pg_indexes WHERE tablename='v_xml_cdr' AND indexdef LIKE '%bridge_uuid%';")
+existing=$(run_psql -c "SELECT count(*) FROM pg_indexes WHERE tablename='v_xml_cdr' AND indexdef LIKE '%bridge_uuid%';")
 
 if [[ "$existing" != "0" ]]; then
     echo "index: already present"
     exit 0
 fi
 
-type=$(psql -c "SELECT data_type FROM information_schema.columns WHERE table_name='v_xml_cdr' AND column_name='bridge_uuid';")
+type=$(run_psql -c "SELECT data_type FROM information_schema.columns WHERE table_name='v_xml_cdr' AND column_name='bridge_uuid';")
 
 if [[ "$type" == "uuid" ]]; then
     target="((bridge_uuid::text))"
@@ -124,14 +125,14 @@ else
     target="(bridge_uuid)"
 fi
 
-rows=$(psql -c "SELECT count(*) FROM v_xml_cdr;")
+rows=$(run_psql -c "SELECT count(*) FROM v_xml_cdr;")
 echo "index: building on $target over $rows rows (bridge_uuid is $type) — this can take minutes"
 
-psql -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS v_xml_cdr_bridge_uuid_idx ON v_xml_cdr $target;"
+run_psql -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS v_xml_cdr_bridge_uuid_idx ON v_xml_cdr $target;"
 
 # CONCURRENTLY can fail part-way and leave the index behind marked invalid,
 # where it is carried by writes but never used by reads — the worst of both.
-invalid=$(psql -c "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+invalid=$(run_psql -c "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
                     WHERE c.relname = 'v_xml_cdr_bridge_uuid_idx' AND NOT i.indisvalid;")
 
 if [[ "$invalid" != "0" ]]; then
