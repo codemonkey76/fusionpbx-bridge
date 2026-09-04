@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+#
+# Deploy the bridge to one or more FusionPBX servers.
+#
+#   ./deploy s01                 one server
+#   ./deploy s01 s02 s03         several, in order, stopping at the first failure
+#   ./deploy --check s01 s02     report what is deployed, change nothing
+#   ./deploy --ref v1.2 s01      deploy a tag or branch rather than origin/main
+#
+# Hosts are ssh destinations — whatever `ssh s01` already resolves to.
+#
+# The server holds a git clone at /opt/fusionpbx-bridge and runs it under Docker
+# Compose, so deploying is: fetch, check out, rebuild, verify. Every step is
+# idempotent, and a server whose health check does not come back is rolled back
+# to the commit it was on before anything else is touched.
+#
+# Rolling back is the reason this is a script rather than four commands. Nothing
+# is lost if the bridge is down — Phoneus advances its cursor only after a poll
+# it could process, so the next one picks up where the last stopped — but call
+# charging quietly stops accruing until somebody notices, and what notices is a
+# status field on the server record that nobody watches. Putting the old
+# container back automatically keeps that window to a minute instead of a day.
+
+set -euo pipefail
+
+REMOTE_DIR=/opt/fusionpbx-bridge
+REF=origin/main
+CHECK_ONLY=0
+HOSTS=()
+
+# How long to wait for the rebuilt container to answer /health before giving up
+# and putting the old one back. A cold build on a small VM is slower than it
+# looks — the PHP image layer is cached, but the first request still pays for
+# the container's start_period.
+HEALTH_TIMEOUT=60
+
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check)   CHECK_ONLY=1; shift ;;
+        --ref)     REF="$2"; shift 2 ;;
+        -h|--help) usage 0 ;;
+        -*)        echo "unknown option: $1" >&2; usage 1 ;;
+        *)         HOSTS+=("$1"); shift ;;
+    esac
+done
+
+[[ ${#HOSTS[@]} -gt 0 ]] || usage 1
+
+say()  { printf '  %s\n' "$*"; }
+fail() { printf '  !! %s\n' "$*" >&2; }
+
+# ── What is on the server right now ──────────────────────────────────────────
+#
+# Read-only, and the first thing every deploy does: a host that is not what this
+# script expects should be found before anything is changed, not half way
+# through. Also the whole of --check.
+inspect() {
+    local host="$1"
+
+    ssh -o BatchMode=yes "$host" REMOTE_DIR="$REMOTE_DIR" 'bash -s' <<'REMOTE'
+set -euo pipefail
+
+[[ -d "$REMOTE_DIR/.git" ]] || { echo "MISSING|no git clone at $REMOTE_DIR"; exit 0; }
+
+commit=$(sudo git -C "$REMOTE_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
+subject=$(sudo git -C "$REMOTE_DIR" log -1 --pretty=%s 2>/dev/null || echo unknown)
+dirty=$(sudo git -C "$REMOTE_DIR" status --porcelain 2>/dev/null | wc -l)
+state=$(sudo docker inspect --format '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+        fusionpbx-bridge 2>/dev/null || echo "absent/none")
+
+# The index the loopback pairing looks up by. Reported as a column of its own
+# because deploying the pairing query without it is the one way this change
+# makes things worse rather than better — see ensure_index.
+idx=$(sudo -u postgres psql -qAt -d fusionpbx -c \
+      "SELECT count(*) FROM pg_indexes WHERE tablename='v_xml_cdr' AND indexdef LIKE '%bridge_uuid%';" 2>/dev/null || echo '?')
+
+echo "OK|$commit|$subject|$dirty|$state|$idx"
+REMOTE
+}
+
+# ── The index the pairing query needs ────────────────────────────────────────
+#
+# The loopback fix looks up v_xml_cdr by bridge_uuid, once per outbound leg. On
+# a stock FusionPBX that column is not indexed, so every lookup is a sequential
+# scan — on a server with a few hundred thousand CDR rows that turns a poll into
+# something that never finishes, and the poll runs every fifteen minutes.
+#
+# The column's type decides the index. Some FusionPBX versions store bridge_uuid
+# as text and others as uuid, which is why the query casts both sides. On a text
+# column that cast is a no-op the planner discards, so a plain index is used and
+# an expression index is not; on a uuid column it is a real cast, so only an
+# expression index matching it can be used. Getting this backwards produces an
+# index that is never read, which looks exactly like having no index at all.
+#
+# CONCURRENTLY because this runs against a live PBX. It is slower and it cannot
+# run inside a transaction — psql -c is autocommit, which is why this is not
+# wrapped in one — and it can leave an invalid index behind if it fails, so that
+# is checked for rather than assumed.
+ensure_index() {
+    local host="$1"
+
+    ssh -o BatchMode=yes "$host" 'bash -s' <<'REMOTE'
+set -euo pipefail
+
+# Not a recursive call: psql here is an argument to sudo, which execs the binary.
+run_psql() { sudo -u postgres psql -qAt -d fusionpbx "$@"; }
+
+existing=$(run_psql -c "SELECT count(*) FROM pg_indexes WHERE tablename='v_xml_cdr' AND indexdef LIKE '%bridge_uuid%';")
+
+if [[ "$existing" != "0" ]]; then
+    echo "index: already present"
+    exit 0
+fi
+
+type=$(run_psql -c "SELECT data_type FROM information_schema.columns WHERE table_name='v_xml_cdr' AND column_name='bridge_uuid';")
+
+if [[ "$type" == "uuid" ]]; then
+    target="((bridge_uuid::text))"
+else
+    target="(bridge_uuid)"
+fi
+
+rows=$(run_psql -c "SELECT count(*) FROM v_xml_cdr;")
+echo "index: building on $target over $rows rows (bridge_uuid is $type) — this can take minutes"
+
+run_psql -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS v_xml_cdr_bridge_uuid_idx ON v_xml_cdr $target;"
+
+# CONCURRENTLY can fail part-way and leave the index behind marked invalid,
+# where it is carried by writes but never used by reads — the worst of both.
+invalid=$(run_psql -c "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+                    WHERE c.relname = 'v_xml_cdr_bridge_uuid_idx' AND NOT i.indisvalid;")
+
+if [[ "$invalid" != "0" ]]; then
+    echo "index: BUILT INVALID — drop it and retry when the server is quieter" >&2
+    exit 1
+fi
+
+echo "index: built"
+REMOTE
+}
+
+# ── Deploy ───────────────────────────────────────────────────────────────────
+deploy() {
+    local host="$1"
+
+    ssh -o BatchMode=yes "$host" REMOTE_DIR="$REMOTE_DIR" REF="$REF" HEALTH_TIMEOUT="$HEALTH_TIMEOUT" 'bash -s' <<'REMOTE'
+set -euo pipefail
+
+cd "$REMOTE_DIR"
+
+previous=$(sudo git rev-parse HEAD)
+echo "was: $(sudo git rev-parse --short HEAD) $(sudo git log -1 --pretty=%s)"
+
+sudo git fetch --quiet origin
+sudo git checkout --quiet --detach "$REF"
+echo "now: $(sudo git rev-parse --short HEAD) $(sudo git log -1 --pretty=%s)"
+
+sudo docker compose up -d --build
+
+# Health, with the key. The container's own check is authenticated too, but it
+# has its own start_period and interval; polling here is what decides whether
+# this deploy stands or goes back.
+key=$(sudo grep -E '^API_KEY=' .env | cut -d= -f2-)
+
+deadline=$(( SECONDS + HEALTH_TIMEOUT ))
+until curl -fsS -H "Authorization: Bearer $key" http://127.0.0.1:8880/health >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+        echo "health: no answer after ${HEALTH_TIMEOUT}s — rolling back" >&2
+        sudo git checkout --quiet --detach "$previous"
+        sudo docker compose up -d --build
+        echo "rolled back to $(sudo git rev-parse --short HEAD)" >&2
+        exit 1
+    fi
+    sleep 2
+done
+
+echo "health: ok"
+REMOTE
+}
+
+# ── Run ──────────────────────────────────────────────────────────────────────
+
+for host in "${HOSTS[@]}"; do
+    printf '\n=== %s ===\n' "$host"
+
+    line=$(inspect "$host") || { fail "unreachable"; exit 1; }
+
+    IFS='|' read -r status a b c d e <<<"$line"
+
+    if [[ "$status" != "OK" ]]; then
+        fail "$a"
+        exit 1
+    fi
+
+    say "commit:    $a  ($b)"
+    say "container: $d"
+    say "bridge_uuid index: $([[ "$e" == "0" ]] && echo "missing" || echo "present")"
+    [[ "$c" == "0" ]] || say "local changes: $c file(s) — deploying will not discard them, but they are not in git"
+
+    if [[ $CHECK_ONLY -eq 1 ]]; then
+        continue
+    fi
+
+    ensure_index "$host" | sed 's/^/  /'
+    deploy "$host" | sed 's/^/  /'
+
+    say "done"
+done
+
+printf '\n'

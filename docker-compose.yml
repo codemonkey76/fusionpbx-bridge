@@ -15,7 +15,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8880/health"]
+      # With the key. Every route is behind it, /health included, so an
+      # unauthenticated check answers 401 for ever: on s01 this had failed 6,012
+      # times in a row against a bridge that was serving Phoneus perfectly well,
+      # which taught everyone to read "unhealthy" as normal.
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$API_KEY\" http://localhost:8880/health >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3
